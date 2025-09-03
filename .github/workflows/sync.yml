@@ -15,5 +15,5 @@ jobs:
         with:
           token: ${{secrets.FORK_SYNC_TOKEN}}
           owner: alibaba
-          base: master
-          head: master
+          base: main
+          head: main
