@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: tgymnich/fork-sync@v2.0
         with:
-          token: ${{ secrets.PERSONAL_TOKEN }}
+          token: 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
           owner: alibaba
           base: master
           head: master
