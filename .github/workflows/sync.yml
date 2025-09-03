@@ -13,4 +13,7 @@ jobs:
     steps:
       - uses: tgymnich/fork-sync@v2.0
         with:
-          repo: alibaba/spring-ai-alibaba
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          owner: alibaba
+          base: master
+          head: master
