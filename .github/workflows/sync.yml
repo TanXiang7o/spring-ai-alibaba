@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: tgymnich/fork-sync@v2.0
         with:
-          token: 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
+          token: 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
           owner: alibaba
           base: master
           head: master
