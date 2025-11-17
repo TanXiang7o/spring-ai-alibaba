@@ -8,7 +8,7 @@
 
 <html>
     <h3 align="center">
-      A production-ready agent framework for building Agentic, Workflow, and Multi-agent applications.
+      A production-ready framework for building Agentic, Workflow, and Multi-agent applications.
     </h3>
     <h3 align="center">
       <a href="https://java2ai.com/docs/quick-start/" target="_blank">Agent Framework Docs</a>,
@@ -71,7 +71,7 @@ mvn spring-boot:run
 Open the browser and visit [http://localhost:8080/chatui/index.html](http://localhost:8080/chatui/index.html) to chat with the ChatBot.
 
 <p align="center">
-    <img src="../../docs/imgs/chatbot-chat-ui.gif" alt="chatbot-ui" style="max-width: 740px; height: 508px" />
+    <img src="./docs/imgs/chatbot-chat-ui.gif" alt="chatbot-ui" style="max-width: 740px; height: 508px" />
 </p>
 
 ### Chatbot Code Explained
