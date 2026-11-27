@@ -33,16 +33,11 @@ import static java.lang.String.format;
  * The type Processed nodes edges and config.
  */
 public record ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Edges edges, Set<String> interruptsBefore,
-										   Set<String> interruptsAfter, Map<String, KeyStrategy> keyStrategyMap) {
+		Set<String> interruptsAfter, Map<String, KeyStrategy> keyStrategyMap, Map<String, String> parallelJoins) {
 
-	/**
-	 * Instantiates a new Processed nodes edges and config.
-	 * 
-	 * @param stateGraph the state graph
-	 * @param config     the config
-	 */
-	ProcessedNodesEdgesAndConfig(StateGraph stateGraph, CompileConfig config) {
-		this(stateGraph.nodes, stateGraph.edges, config.interruptsBefore(), config.interruptsAfter(), Map.of());
+	public ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Edges edges, Set<String> interruptsBefore,
+			Set<String> interruptsAfter, Map<String, KeyStrategy> keyStrategyMap) {
+		this(nodes, edges, interruptsBefore, interruptsAfter, keyStrategyMap, Map.of());
 	}
 
 	/**
@@ -57,9 +52,16 @@ public record ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Ed
 			throws GraphStateException {
 
 		var subgraphNodes = stateGraph.nodes.onlySubStateGraphNodes();
+		Map<String, KeyStrategy> keyStrategyMap = new LinkedHashMap<>();
+		for (var node : stateGraph.nodes.elements) {
+			if (node instanceof SubGraphNode subGraphNode) {
+				subGraphNode.keyStrategies().forEach(keyStrategyMap::putIfAbsent);
+			}
+		}
 
 		if (subgraphNodes.isEmpty()) {
-			return new ProcessedNodesEdgesAndConfig(stateGraph, config);
+			return new ProcessedNodesEdgesAndConfig(stateGraph.nodes, stateGraph.edges, config.interruptsBefore(),
+					config.interruptsAfter(), keyStrategyMap, Map.copyOf(stateGraph.parallelJoins));
 		}
 
 		var interruptsBefore = config.interruptsBefore();
@@ -67,17 +69,14 @@ public record ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Ed
 		var nodes = new StateGraph.Nodes(stateGraph.nodes.exceptSubStateGraphNodes());
 		var edges = new StateGraph.Edges(stateGraph.edges.elements);
 
-		Map<String, KeyStrategy> keyStrategyMap = new LinkedHashMap<>();
+		var parallelJoins = new LinkedHashMap<>(stateGraph.parallelJoins);
 
 		for (var subgraphNode : subgraphNodes) {
 
 			var sgWorkflow = subgraphNode.subGraph();
 
-            // Merges keyStrategies of this subgraph.
-            subgraphNode.keyStrategies().forEach(keyStrategyMap::putIfAbsent);
-            // Merges the keyStrategyMap aggregated from recursive subgraphs.
-            ProcessedNodesEdgesAndConfig processedSubGraph = process(sgWorkflow, config);
-            processedSubGraph.keyStrategyMap().forEach(keyStrategyMap::putIfAbsent);
+			ProcessedNodesEdgesAndConfig processedSubGraph = process(sgWorkflow, config);
+			processedSubGraph.keyStrategyMap().forEach(keyStrategyMap::putIfAbsent);
 
 			StateGraph.Nodes processedSubGraphNodes = processedSubGraph.nodes;
 			StateGraph.Edges processedSubGraphEdges = processedSubGraph.edges;
@@ -98,6 +97,7 @@ public record ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Ed
 			}
 
 			var sgEdgeStartRealTargetId = subgraphNode.formatId(sgEdgeStartTarget.id());
+			parallelJoins.replaceAll((fork, join) -> Objects.equals(join, subgraphNode.id()) ? sgEdgeStartRealTargetId : join);
 
 			// Process Interruption (Before) Subgraph(s)
 			interruptsBefore = interruptsBefore.stream()
@@ -130,6 +130,14 @@ public record ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Ed
 
 			if (edgeWithSubgraphSourceId.isParallel()) {
 				throw new GraphStateException("subgraph not support routes to parallel branches yet!");
+			}
+			for (var join : processedSubGraph.parallelJoins().entrySet()) {
+				String joinTarget = END.equals(join.getValue()) ? edgeWithSubgraphSourceId.target().id()
+						: subgraphNode.formatId(join.getValue());
+				if (joinTarget == null) {
+					throw new GraphStateException("An inline subgraph that joins at END requires a direct exit edge");
+				}
+				parallelJoins.put(subgraphNode.formatId(join.getKey()), joinTarget);
 			}
 
 			// Process Interruption (After) Subgraph(s)
@@ -167,6 +175,7 @@ public record ProcessedNodesEdgesAndConfig(StateGraph.Nodes nodes, StateGraph.Ed
                     .forEach(nodes.elements::add);
 		}
 
-		return new ProcessedNodesEdgesAndConfig(nodes, edges, interruptsBefore, interruptsAfter, keyStrategyMap);
+		return new ProcessedNodesEdgesAndConfig(nodes, edges, interruptsBefore, interruptsAfter, keyStrategyMap,
+				Map.copyOf(parallelJoins));
 	}
 }

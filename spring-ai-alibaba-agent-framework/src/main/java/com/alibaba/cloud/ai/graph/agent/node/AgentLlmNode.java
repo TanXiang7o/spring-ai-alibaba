@@ -18,6 +18,7 @@ package com.alibaba.cloud.ai.graph.agent.node;
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.action.NodeActionWithConfig;
+import com.alibaba.cloud.ai.graph.agent.context.ContextWindowPolicy;
 import com.alibaba.cloud.ai.graph.serializer.AgentInstructionMessage;
 import com.alibaba.cloud.ai.graph.utils.TypeRef;
 import com.alibaba.cloud.ai.graph.utils.FinishReasonMetadata;
@@ -99,6 +100,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 	private boolean enableReasoningLog;
 
+	private final ContextWindowPolicy contextWindowPolicy;
+
 	public AgentLlmNode(Builder builder) {
 		this.agentName = builder.agentName;
 		this.outputKey = builder.outputKey;
@@ -121,6 +124,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		this.chatClient = builder.chatClient;
 		this.chatOptions = builder.chatOptions instanceof ToolCallingChatOptions options ? options : null;
 		this.enableReasoningLog = builder.enableReasoningLog;
+		this.contextWindowPolicy = builder.contextWindowPolicy;
 	}
 
 	public static Builder builder() {
@@ -169,16 +173,14 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		}
 
 		// Check and manage messages
-		List<Message> messages = new ArrayList<>();
-		if (state.value("messages").isEmpty()) {
+		List<Message> messages = new ArrayList<>(state.<List<Message>>value("messages").orElseGet(List::of));
+		if (messages.isEmpty()) {
 			// try with "input" key, which is more commonly used in graph input when agent is used as a node.
 			if (state.value("input").isPresent()) {
 				messages.add(new UserMessage(state.value("input").get().toString()));
 			} else {
 				throw new IllegalArgumentException("Either 'instruction' or 'includeContents' must be set for Agent.");
 			}
-		} else {
-			messages = (List<Message>) state.value("messages").get();
 		}
 
 		augmentUserMessage(messages, outputSchema);
@@ -251,7 +253,10 @@ public class AgentLlmNode implements NodeActionWithConfig {
 								streamingInterceptors, chatResponseFlux, request);
 					}
 					return ModelResponse.of(chatResponseFlux);
-				} catch (Exception e) {
+				} catch (RuntimeException e) {
+					if (this.contextWindowPolicy != null) {
+						throw e;
+					}
 					logger.error("Exception during streaming model call: ", e);
 					return ModelResponse.of(new AssistantMessage("Exception: " + e.getMessage()));
 				}
@@ -303,7 +308,10 @@ public class AgentLlmNode implements NodeActionWithConfig {
 					}
 
 					return ModelResponse.of(responseMessage, response);
-				} catch (Exception e) {
+				} catch (RuntimeException e) {
+					if (this.contextWindowPolicy != null) {
+						throw e;
+					}
 					logger.error("Exception during invoking model call: ", e);
 					return ModelResponse.of(new AssistantMessage("Exception: " + e.getMessage()));
 				}
@@ -486,7 +494,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 				.advisors(this.advisors);
 		var prepare = scope.prepareAdvisor(requestCallbacks, request.getDynamicToolCallbacks(), replaceDefaults,
 				selection);
-		var capture = scope.captureAdvisor(selection);
+		var capture = scope.captureAdvisor(selection, this.contextWindowPolicy);
 		if (promptSpec instanceof DefaultChatClientRequestSpec spec) {
 			// Graph owns dispatch and approval. On equal order ChatClient runs the
 			// last registered advisor first, so put capture before other registrations.
@@ -531,6 +539,13 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		private boolean enableReasoningLog;
 
 		private ChatOptions chatOptions;
+
+		private ContextWindowPolicy contextWindowPolicy;
+
+		public Builder contextWindowPolicy(ContextWindowPolicy policy) {
+			this.contextWindowPolicy = policy;
+			return this;
+		}
 
 		public Builder agentName(String agentName) {
 			this.agentName = agentName;

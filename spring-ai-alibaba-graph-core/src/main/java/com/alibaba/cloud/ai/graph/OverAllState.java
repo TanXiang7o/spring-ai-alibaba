@@ -34,6 +34,7 @@ import java.util.stream.Collector;
 import java.util.stream.Stream;
 
 import static com.alibaba.cloud.ai.graph.utils.CollectionsUtils.entryOf;
+import static com.alibaba.cloud.ai.graph.utils.SerializationUtils.deepCopyMap;
 import static java.util.Collections.unmodifiableMap;
 import static java.util.Optional.ofNullable;
 
@@ -114,12 +115,13 @@ public final class OverAllState implements Serializable {
 	}
 
 	/**
-	 * Snap shot optional.
-	 * @return the optional
+	 * Copies state for an isolated execution branch. State values must be immutable
+	 * or supported by the state copy utility.
+	 * @return the state snapshot
 	 */
 	public Optional<OverAllState> snapShot() {
 		return Optional
-			.of(new OverAllState(new HashMap<>(this.data), new HashMap<>(this.keyStrategies), this.store));
+			.of(new OverAllState(deepCopyMap(this.data), new HashMap<>(this.keyStrategies), this.store));
 	}
 
 	/**
@@ -226,7 +228,7 @@ public final class OverAllState implements Serializable {
 
 		Map<String, KeyStrategy> keyStrategies = keyStrategies();
 		input.keySet().stream().filter(key -> keyStrategies.containsKey(key)).forEach(key -> {
-			this.data.put(key, keyStrategies.get(key).apply(value(key, null), input.get(key)));
+			this.data.put(key, keyStrategies.get(key).apply(data.get(key), input.get(key)));
 		});
 		return this;
 	}
@@ -277,7 +279,7 @@ public final class OverAllState implements Serializable {
 			if (partialState.get(key) == MARK_FOR_REMOVAL) {
 				this.data.remove(key);
 			} else {
-				this.data.put(key, strategy.apply(value(key, null), partialState.get(key)));
+				this.data.put(key, strategy.apply(data.get(key), partialState.get(key)));
 			}
 		});
 		return data();
@@ -306,7 +308,7 @@ public final class OverAllState implements Serializable {
 				this.data.remove(key);
 			}
 			else {
-				this.data.put(key, strategy.apply(value(key, null), partialState.get(key)));
+				this.data.put(key, strategy.apply(data.get(key), partialState.get(key)));
 			}
 		});
 	}

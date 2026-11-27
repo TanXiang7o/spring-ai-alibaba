@@ -53,17 +53,18 @@ public abstract class BaseGraphExecutor {
 			AtomicReference<Object> resultValue) {
 		return Flux.defer(() -> {
 			try {
-				if (context.getCompiledGraph().compileConfig.releaseThread()
+				var branchMetadata = context.branchCompletionMetadata();
+				if (!context.isParallelBranch() && context.getCompiledGraph().compileConfig.releaseThread()
 						&& context.getCompiledGraph().compileConfig.checkpointSaver().isPresent()) {
 					BaseCheckpointSaver.Tag tag = context
 						.getCompiledGraph().compileConfig.checkpointSaver()
 						.get()
 						.release(context.getConfig());
-					resultValue.set(tag);
+					resultValue.set(context.isEmbeddedRun() ? new HashMap<>(context.getOverallState().data()) : tag);
 				} else {
 					resultValue.set(new HashMap<>(context.getOverallState().data()));
 				}
-				return Flux.just(GraphResponse.done(resultValue.get()));
+				return Flux.just(GraphResponse.done(resultValue.get(), branchMetadata));
 			}
 			catch (Exception e) {
 				return Flux.just(GraphResponse.error(e));
