@@ -26,6 +26,8 @@ import com.alibaba.cloud.ai.graph.action.AsyncNodeActionWithConfig;
 import com.alibaba.cloud.ai.graph.internal.ParallelBranchPath;
 import com.alibaba.cloud.ai.graph.streaming.GraphFlux;
 import com.alibaba.cloud.ai.graph.streaming.ParallelGraphFlux;
+import com.alibaba.cloud.ai.graph.streaming.RunEvent;
+import com.alibaba.cloud.ai.graph.streaming.RunEventContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,7 +49,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class NodeExecution {
 
 	private static final Logger log = LoggerFactory.getLogger(NodeExecution.class);
-	private static final String TASK_TRACE_KEY = "_GRAPH_TASK_TRACE_";
 
 	private NodeExecution() {
 	}
@@ -79,7 +80,7 @@ final class NodeExecution {
 					.removeMetadata(RunnableConfig.TASK_ATTEMPT_METADATA_KEY);
 		}
 		if (trace != null) {
-			builder.addMetadata(TASK_TRACE_KEY, trace);
+			builder.addMetadata(RunnableConfig.TASK_TRACE_METADATA_KEY, trace);
 		}
 		return builder.build();
 	}
@@ -97,8 +98,9 @@ final class NodeExecution {
 						.addMetadata(RunnableConfig.TASK_ID_METADATA_KEY, taskId)
 						.addMetadata(RunnableConfig.TASK_ATTEMPT_METADATA_KEY, attempt);
 				if (trace != null) {
-					builder.addMetadata(TASK_TRACE_KEY, trace);
+					builder.addMetadata(RunnableConfig.TASK_TRACE_METADATA_KEY, trace);
 				}
+				config.eventContext().ifPresent(events -> builder.eventContext(events.attempt(attempt)));
 				var attemptConfig = builder.build();
 				long started = System.nanoTime();
 				var invocation = Mono.defer(() -> Mono.fromFuture(action.apply(state.snapShot().orElseThrow(),
@@ -134,21 +136,33 @@ final class NodeExecution {
 
 	private static Mono<Map<String, Object>> track(TaskTrace trace, int attempt,
 			RunnableConfig config, Mono<Map<String, Object>> result) {
-		if (trace == null) {
+		var events = config.eventContext().map(scope -> scope.attempt(attempt)).orElse(null);
+		if (trace == null && events == null) {
 			return result;
 		}
 		return Mono.defer(() -> {
-			trace.emit(config, attempt, Phase.STARTED, null);
-			return result.doOnSuccess(update -> trace.emit(config, attempt, Phase.RESULT_READY, null))
-					.doOnError(error -> trace.emit(config, attempt, Phase.FAILED, error))
-					.doOnCancel(() -> trace.emit(config, attempt, Phase.CANCELLED, null));
+			emitAttempt(trace, events, config, attempt, Phase.STARTED, null);
+			return result.doOnSuccess(update -> emitAttempt(trace, events, config, attempt, Phase.RESULT_READY, null))
+					.doOnError(error -> emitAttempt(trace, events, config, attempt, Phase.FAILED, error))
+					.doOnCancel(() -> emitAttempt(trace, events, config, attempt, Phase.CANCELLED, null));
 		});
+	}
+
+	private static void emitAttempt(TaskTrace trace, RunEventContext events, RunnableConfig config, int attempt,
+			Phase phase, Throwable failure) {
+		if (trace != null) {
+			trace.emit(config, attempt, phase, failure);
+		}
+		if (events != null) {
+			events.emit(RunEvent.Type.ATTEMPT,
+					new RunEvent.Attempt(phase.name(), failure == null ? null : RunEventContext.failure(failure)));
+		}
 	}
 
 	private static TaskTrace taskTrace(GraphRunnerContext context, String nodeId, String taskId, RunnableConfig config) {
 		var graph = context.getCompiledGraph();
 		var localListeners = graph.compileConfig.lifecycleListeners();
-		var enclosing = context.getConfig().metadata(TASK_TRACE_KEY)
+		var enclosing = context.getConfig().metadata(RunnableConfig.TASK_TRACE_METADATA_KEY)
 				.filter(TaskTrace.class::isInstance).map(TaskTrace.class::cast).orElse(null);
 		if (enclosing == null && localListeners.isEmpty()) {
 			return null;

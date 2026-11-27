@@ -15,9 +15,13 @@
  */
 package com.alibaba.cloud.ai.graph.agent.node;
 
+import com.alibaba.cloud.ai.graph.streaming.ModelEvents;
+
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
+import com.alibaba.cloud.ai.graph.GraphLifecycleListener;
 import com.alibaba.cloud.ai.graph.action.NodeActionWithConfig;
+import com.alibaba.cloud.ai.graph.agent.context.CheckpointContextCompaction;
 import com.alibaba.cloud.ai.graph.agent.context.ContextWindowPolicy;
 import com.alibaba.cloud.ai.graph.serializer.AgentInstructionMessage;
 import com.alibaba.cloud.ai.graph.utils.TypeRef;
@@ -28,8 +32,12 @@ import com.alibaba.cloud.ai.graph.agent.interceptor.ModelRequest;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ModelResponse;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ModelCallHandler;
 import com.alibaba.cloud.ai.graph.agent.interceptor.InterceptorChain;
+import com.alibaba.cloud.ai.graph.agent.tool.DeferredToolCatalog;
 import com.alibaba.cloud.ai.graph.agent.tool.ToolCallbackUtils;
 import com.alibaba.cloud.ai.graph.agent.interceptor.StreamingModelInterceptor;
+import com.alibaba.cloud.ai.graph.agent.interceptor.modelfallback.ModelFallbackInterceptor;
+import com.alibaba.cloud.ai.graph.agent.model.ModelRoutingPolicy;
+import com.alibaba.cloud.ai.graph.agent.structured.StructuredOutputFormat;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClientAttributes;
@@ -77,6 +85,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 	private List<Advisor> advisors = new ArrayList<>();
 
+	private final DeferredToolCatalog deferredToolCatalog;
+
 	private volatile List<ToolCallback> toolCallbacks = List.of();
 
 	private List<ModelInterceptor> modelInterceptors = new ArrayList<>();
@@ -87,6 +97,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 	private String outputKey;
 
 	private String outputSchema;
+
+	private final StructuredOutputFormat structuredOutput;
 
 	private ChatClient chatClient;
 
@@ -102,10 +114,15 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 	private final ContextWindowPolicy contextWindowPolicy;
 
+	private final ModelRoutingPolicy modelRoutingPolicy;
+
+	private final CheckpointContextCompaction checkpointContextCompaction;
+
 	public AgentLlmNode(Builder builder) {
 		this.agentName = builder.agentName;
 		this.outputKey = builder.outputKey;
 		this.outputSchema = builder.outputSchema;
+		this.structuredOutput = builder.structuredOutput;
 		this.systemPrompt = builder.systemPrompt;
 		this.instruction = builder.instruction;
 		this.templateRenderer = builder.templateRenderer;
@@ -115,6 +132,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		if (builder.toolCallbacks != null) {
 			this.toolCallbacks = List.copyOf(builder.toolCallbacks);
 		}
+		this.deferredToolCatalog = builder.deferredToolCatalog;
 		if (builder.modelInterceptors != null) {
 			this.modelInterceptors = builder.modelInterceptors;
 		}
@@ -125,6 +143,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		this.chatOptions = builder.chatOptions instanceof ToolCallingChatOptions options ? options : null;
 		this.enableReasoningLog = builder.enableReasoningLog;
 		this.contextWindowPolicy = builder.contextWindowPolicy;
+		this.modelRoutingPolicy = builder.modelRoutingPolicy;
+		this.checkpointContextCompaction = builder.checkpointContextCompaction;
 	}
 
 	public static Builder builder() {
@@ -183,8 +203,20 @@ public class AgentLlmNode implements NodeActionWithConfig {
 			}
 		}
 
-		augmentUserMessage(messages, outputSchema);
+		Map<String, Object> updatedState = new HashMap<>();
+		if (this.checkpointContextCompaction != null) {
+			String key = CheckpointContextCompaction.stateKey(this.agentName);
+			var prepared = this.checkpointContextCompaction.prepare(messages, state.value(key).orElse(null));
+			messages = new ArrayList<>(prepared.messages());
+			if (!prepared.checkpointUpdate().isEmpty()) {
+				updatedState.put(key, prepared.checkpointUpdate());
+			}
+		}
+
 		renderTemplatedUserMessage(messages, state.data(), config.metadata());
+		if (structuredOutput == null) {
+			augmentUserMessage(messages, outputSchema);
+		}
 
 		// Create ModelRequest; include state in context so interceptors (e.g. handoffs step-config) can read it
 		Map<String, Object> contextMap = new HashMap<>(state.data());
@@ -192,11 +224,20 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		if (!metadata.isEmpty()) {
 			contextMap.putAll(metadata);
 		}
+		List<ToolCallback> loaded = List.of();
+		if (this.deferredToolCatalog != null) {
+			contextMap.put(DeferredToolCatalog.DISCOVERY_CONTEXT_KEY, true);
+			loaded = this.deferredToolCatalog.activeCallbacks(state, this.agentName);
+		}
 		var configuredCallbacks = ToolCallbackUtils.deduplicateByName(this.toolCallbacks,
-				this.chatOptions != null ? this.chatOptions.getToolCallbacks() : null);
+				this.chatOptions != null ? this.chatOptions.getToolCallbacks() : null, loaded);
 		var initialOptions = this.chatOptions != null
 				? this.chatOptions.mutate().toolCallbacks(configuredCallbacks).build() : null;
 		var scope = new RequestToolScope(agentName, configuredCallbacks);
+		var structuredAdvisor = structuredOutput == null ? null
+				: new StructuredOutputAdvisor(structuredOutput, agentName,
+						state.value(GraphLifecycleListener.EXECUTION_ID_KEY, String.class).orElse(""),
+						this::augmentUserMessage, config.mergeReasoningContent());
 		ModelRequest.Builder requestBuilder = ModelRequest.builder()
 				.messages(messages)
 				.options(initialOptions)
@@ -217,7 +258,9 @@ public class AgentLlmNode implements NodeActionWithConfig {
 			requestBuilder.systemMessage(new SystemMessage(this.systemPrompt));
 		}
 
-		ModelRequest modelRequest = requestBuilder.build();
+		ModelRequest modelRequest = route(requestBuilder.build(), state, updatedState);
+		boolean propagateModelErrors = this.structuredOutput != null || this.contextWindowPolicy != null || this.modelRoutingPolicy != null
+				|| this.modelInterceptors.stream().anyMatch(ModelFallbackInterceptor.class::isInstance);
 
 		// add streaming support
 		boolean stream = config.metadata("_stream_", new TypeRef<Boolean>(){}).orElse(true);
@@ -232,7 +275,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 									.orElse(THREAD_ID_DEFAULT), agentName, systemPrompt);
 						}
 					}
-					Flux<ChatResponse> chatResponseFlux = buildChatClientRequestSpec(request, modelRequest, configuredCallbacks, scope).stream().chatResponse();
+					Flux<ChatResponse> chatResponseFlux = buildChatClientRequestSpec(request, modelRequest,
+							configuredCallbacks, scope, structuredAdvisor).stream().chatResponse();
 					if (enableReasoningLog && streamingOutputFilters.isEmpty()) {
 						chatResponseFlux = chatResponseFlux.doOnNext(chatResponse -> {
 							if (chatResponse != null && chatResponse.getResult() != null && chatResponse.getResult().getOutput() != null) {
@@ -254,7 +298,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 					}
 					return ModelResponse.of(chatResponseFlux);
 				} catch (RuntimeException e) {
-					if (this.contextWindowPolicy != null) {
+					if (propagateModelErrors || request.getModelTarget() != null) {
 						throw e;
 					}
 					logger.error("Exception during streaming model call: ", e);
@@ -271,8 +315,9 @@ public class AgentLlmNode implements NodeActionWithConfig {
 			Object output = modelResponse.getMessage();
 			if (!streamingOutputFilters.isEmpty()) {
 				if (output instanceof Flux<?> chunks) {
-					output = ChatResponseStreamAggregator.aggregate(chunks.cast(ChatResponse.class),
-							config.mergeReasoningContent()).map(this::filterStreamedResponse).flux();
+					var filtered = ChatResponseStreamAggregator.aggregate(chunks.cast(ChatResponse.class),
+							config.mergeReasoningContent()).map(this::filterStreamedResponse);
+					output = (config.eventContext().isPresent() ? filtered.map(ModelEvents::finalResponse) : filtered).flux();
 				}
 				else if (output instanceof AssistantMessage assistant) {
 					output = filterStreamedMessage(assistant);
@@ -285,7 +330,12 @@ public class AgentLlmNode implements NodeActionWithConfig {
 			else if (output instanceof AssistantMessage assistant && assistant.hasToolCalls()) {
 				output = scope.mark(assistant, config);
 			}
-			return Map.of(StringUtils.hasLength(this.outputKey) ? this.outputKey : "messages", output);
+			if (output instanceof AssistantMessage assistant) {
+				config.eventContext().ifPresent(events -> ModelEvents.completed(events, assistant,
+						modelResponse.getChatResponse() == null ? null : modelResponse.getChatResponse().getMetadata().getUsage()));
+			}
+			updatedState.put(StringUtils.hasLength(this.outputKey) ? this.outputKey : "messages", output);
+			return updatedState;
 		} else {
 			// Create base handler that actually calls the model
 			ModelCallHandler baseHandler = request -> {
@@ -295,7 +345,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 						logger.info("[ThreadId {}] Agent {} reasoning round {} with system prompt: {}.", config.threadId().orElse(THREAD_ID_DEFAULT), agentName, iterations.get(), systemPrompt);
 					}
 
-					ChatResponse response = buildChatClientRequestSpec(request, modelRequest, configuredCallbacks, scope).call().chatResponse();
+					ChatResponse response = buildChatClientRequestSpec(request, modelRequest, configuredCallbacks,
+							scope, structuredAdvisor).call().chatResponse();
 
 					AssistantMessage responseMessage = new AssistantMessage("Empty response from model for unknown reason");
 					if (response != null && response.getResult() != null && response.getResult().getOutput() != null) {
@@ -309,7 +360,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 					return ModelResponse.of(responseMessage, response);
 				} catch (RuntimeException e) {
-					if (this.contextWindowPolicy != null) {
+					if (propagateModelErrors || request.getModelTarget() != null) {
 						throw e;
 					}
 					logger.error("Exception during invoking model call: ", e);
@@ -330,10 +381,12 @@ public class AgentLlmNode implements NodeActionWithConfig {
 			Usage tokenUsage = modelResponse.getChatResponse() != null ? modelResponse.getChatResponse().getMetadata()
 					.getUsage() : new EmptyUsage();
 
-			Map<String, Object> updatedState = new HashMap<>();
 			updatedState.put("_TOKEN_USAGE_", tokenUsage);
 			var output = modelResponse.getMessage() instanceof AssistantMessage assistant && assistant.hasToolCalls()
 					? scope.mark(assistant, config) : modelResponse.getMessage();
+			if (output instanceof AssistantMessage assistant) {
+				config.eventContext().ifPresent(events -> ModelEvents.completed(events, assistant, tokenUsage));
+			}
 			updatedState.put("messages", output);
 			if (StringUtils.hasLength(this.outputKey)) {
 				updatedState.put(this.outputKey, output);
@@ -341,6 +394,24 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 			return updatedState;
 		}
+	}
+
+	private ModelRequest route(ModelRequest request, OverAllState state, Map<String, Object> updates) {
+		if (this.modelRoutingPolicy == null) {
+			return request;
+		}
+		String key = "_MODEL_ROUTE_:" + this.agentName;
+		var executionId = state.value(GraphLifecycleListener.EXECUTION_ID_KEY, String.class);
+		String name;
+		if (executionId.isPresent() && state.value(key).orElse(null) instanceof Map<?, ?> route
+				&& executionId.get().equals(route.get("executionId")) && route.get("name") instanceof String saved) {
+			name = saved;
+		}
+		else {
+			name = this.modelRoutingPolicy.select(request);
+			executionId.ifPresent(id -> updates.put(key, Map.of("executionId", id, "name", name)));
+		}
+		return ModelRequest.builder(request).modelTarget(this.modelRoutingPolicy.target(name)).build();
 	}
 
 	private ChatResponse markStreamedResponse(ChatResponse response, RequestToolScope scope, RunnableConfig config) {
@@ -409,6 +480,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		return builder.build().render(params);
 	}
 
+	/** Appends the output format to the model request after any instruction template has been rendered. */
 	public void augmentUserMessage(List<Message> messages, String outputSchema) {
 		if (!StringUtils.hasText(outputSchema)) {
 			return;
@@ -417,25 +489,20 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		for (int i = messages.size() - 1; i >= 0; i--) {
 			Message message = messages.get(i);
 			if (message instanceof UserMessage userMessage) {
-				// Check if outputSchema is already present to avoid duplication
 				if (!userMessage.getText().contains(outputSchema)) {
 					messages.set(i, userMessage.mutate().part(TextPart.of(System.lineSeparator() + outputSchema)).build());
 				}
-				break;
+				return;
 			}
 			if (message instanceof AgentInstructionMessage templatedUserMessage) {
-                String newOutputSchema = outputSchema.replace("{", "\\{").replace("}", "\\}");
-                // Check if outputSchema is already present to avoid duplication
-                if (!templatedUserMessage.getText().contains(newOutputSchema)) {
-                	messages.set(i, templatedUserMessage.mutate().text(templatedUserMessage.getText() + System.lineSeparator() + newOutputSchema).build());
-                }
-				break;
-			}
-
-			if (i == 0) {
-				messages.add(new UserMessage(outputSchema));
+				if (!templatedUserMessage.getText().contains(outputSchema)) {
+					messages.set(i, templatedUserMessage.mutate()
+							.text(templatedUserMessage.getText() + System.lineSeparator() + outputSchema).build());
+				}
+				return;
 			}
 		}
+		messages.add(new UserMessage(outputSchema));
 	}
 
 	public void renderTemplatedUserMessage(List<Message> messages, Map<String, Object> params, Optional<Map<String, Object>> metadata) {
@@ -477,10 +544,16 @@ public class AgentLlmNode implements NodeActionWithConfig {
 	}
 
 	private ChatClient.ChatClientRequestSpec buildChatClientRequestSpec(ModelRequest request,
-			ModelRequest originalRequest, List<ToolCallback> configuredCallbacks, RequestToolScope scope) {
+			ModelRequest originalRequest, List<ToolCallback> configuredCallbacks, RequestToolScope scope,
+			StructuredOutputAdvisor structuredAdvisor) {
 		var options = request.getOptions();
 		var originalOptions = originalRequest.getOptions();
 		var optionCallbacks = options != null ? options.getToolCallbacks() : null;
+		var target = request.getModelTarget();
+		var targetModel = target == null ? null : target.model();
+		var targetOptions = targetModel == null ? null : targetModel.getOptions();
+		var policy = target != null && target.contextWindowPolicy() != null
+				? target.contextWindowPolicy() : this.contextWindowPolicy;
 		boolean replaceDefaults = options != null && !Objects.equals(optionCallbacks,
 				originalOptions != null ? originalOptions.getToolCallbacks() : null);
 		var requestCallbacks = replaceDefaults ? ToolCallbackUtils.deduplicateByName(optionCallbacks)
@@ -493,8 +566,12 @@ public class AgentLlmNode implements NodeActionWithConfig {
 						ChatClientAttributes.TOOL_CALLING_ADVISOR_AUTO_REGISTER.getKey(), false))
 				.advisors(this.advisors);
 		var prepare = scope.prepareAdvisor(requestCallbacks, request.getDynamicToolCallbacks(), replaceDefaults,
-				selection);
-		var capture = scope.captureAdvisor(selection, this.contextWindowPolicy);
+				selection, targetOptions);
+		var capture = scope.captureAdvisor(selection, policy, targetModel,
+				structuredAdvisor == null ? null : structuredAdvisor.resultTool());
+		if (structuredAdvisor != null) {
+			promptSpec.advisors(structuredAdvisor);
+		}
 		if (promptSpec instanceof DefaultChatClientRequestSpec spec) {
 			// Graph owns dispatch and approval. On equal order ChatClient runs the
 			// last registered advisor first, so put capture before other registrations.
@@ -505,7 +582,7 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		else {
 			promptSpec.advisors(prepare, capture);
 		}
-		if (options != null) {
+		if (options != null && targetModel == null) {
 			// Keep provider options. Callback merging is handled after ChatClient has
 			// applied its model defaults and tool providers.
 			promptSpec.options(options.mutate().toolCallbacks((List<ToolCallback>) null));
@@ -520,6 +597,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 		private String outputSchema;
 
+		private StructuredOutputFormat structuredOutput;
+
 		private String systemPrompt;
 
 		private TemplateRenderer templateRenderer;
@@ -529,6 +608,8 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		private List<Advisor> advisors;
 
 		private List<ToolCallback> toolCallbacks;
+
+		private DeferredToolCatalog deferredToolCatalog;
 
 		private List<ModelInterceptor> modelInterceptors;
 
@@ -541,6 +622,20 @@ public class AgentLlmNode implements NodeActionWithConfig {
 		private ChatOptions chatOptions;
 
 		private ContextWindowPolicy contextWindowPolicy;
+
+		private ModelRoutingPolicy modelRoutingPolicy;
+
+		public Builder modelRouting(ModelRoutingPolicy policy) {
+			this.modelRoutingPolicy = policy;
+			return this;
+		}
+
+		private CheckpointContextCompaction checkpointContextCompaction;
+
+		public Builder checkpointContextCompaction(CheckpointContextCompaction compaction) {
+			this.checkpointContextCompaction = compaction;
+			return this;
+		}
 
 		public Builder contextWindowPolicy(ContextWindowPolicy policy) {
 			this.contextWindowPolicy = policy;
@@ -562,6 +657,11 @@ public class AgentLlmNode implements NodeActionWithConfig {
 			return this;
 		}
 
+		public Builder structuredOutput(StructuredOutputFormat structuredOutput) {
+			this.structuredOutput = structuredOutput;
+			return this;
+		}
+
 		public Builder systemPrompt(String systemPrompt) {
 			this.systemPrompt = systemPrompt;
 			return this;
@@ -579,6 +679,11 @@ public class AgentLlmNode implements NodeActionWithConfig {
 
 		public Builder toolCallbacks(List<ToolCallback> toolCallbacks) {
 			this.toolCallbacks = toolCallbacks;
+			return this;
+		}
+
+		public Builder deferredToolCatalog(DeferredToolCatalog deferredToolCatalog) {
+			this.deferredToolCatalog = deferredToolCatalog;
 			return this;
 		}
 

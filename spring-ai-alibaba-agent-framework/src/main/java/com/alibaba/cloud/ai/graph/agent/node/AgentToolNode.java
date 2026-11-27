@@ -15,6 +15,12 @@
  */
 package com.alibaba.cloud.ai.graph.agent.node;
 
+import com.alibaba.cloud.ai.graph.agent.tool.StreamingToolCallback;
+import com.alibaba.cloud.ai.graph.streaming.RunEvent;
+import com.alibaba.cloud.ai.graph.streaming.RunEventContext;
+
+import com.alibaba.cloud.ai.graph.agent.context.ToolResultArchive;
+
 import com.alibaba.cloud.ai.graph.GraphLifecycleListener;
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
@@ -33,6 +39,7 @@ import com.alibaba.cloud.ai.graph.agent.tool.AsyncToolCallback;
 import com.alibaba.cloud.ai.graph.agent.tool.AsyncToolCallbackAdapter;
 import com.alibaba.cloud.ai.graph.agent.tool.CancellableAsyncToolCallback;
 import com.alibaba.cloud.ai.graph.agent.tool.CancellationToken;
+import com.alibaba.cloud.ai.graph.agent.tool.DeferredToolCatalog;
 import com.alibaba.cloud.ai.graph.agent.tool.DefaultCancellationToken;
 import com.alibaba.cloud.ai.graph.agent.tool.StateAwareToolCallback;
 import com.alibaba.cloud.ai.graph.agent.tool.ToolCancelledException;
@@ -79,6 +86,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
 import static com.alibaba.cloud.ai.graph.RunnableConfig.AGENT_TOOL_NAME;
@@ -117,6 +125,10 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 	private final String agentName;
 
+	private final ToolResultArchive toolResultArchive;
+
+	private final DeferredToolCatalog deferredToolCatalog;
+
 	private final String budgetStateKey;
 	private final String pendingAgentToolsStateKey;
 	private final int maxCallsPerTool;
@@ -144,6 +156,8 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 	public AgentToolNode(Builder builder) {
 		this.agentName = builder.agentName;
+		this.toolResultArchive = builder.toolResultArchive;
+		this.deferredToolCatalog = builder.deferredToolCatalog;
 		this.budgetStateKey = "_TOOL_CALL_BUDGET_:" + Objects.toString(agentName, "");
 		this.pendingAgentToolsStateKey = "_PENDING_AGENT_TOOLS_:" + Objects.toString(agentName, "");
 		this.maxCallsPerTool = builder.maxCallsPerTool;
@@ -176,6 +190,12 @@ public class AgentToolNode implements NodeActionWithConfig {
 	}
 
 	private static final ToolCallConfirmationPolicy CONFIRMATION_POLICY = ToolCallConfirmationPolicy.fromToolMetadata();
+
+	private Predicate<ToolCallRequest> configuredToolReview = request -> false;
+
+	public void setConfiguredToolReview(Predicate<ToolCallRequest> configuredToolReview) {
+		this.configuredToolReview = configuredToolReview;
+	}
 
 	public boolean requiresConfirmation(AssistantMessage.ToolCall call, RunnableConfig config) {
 		ToolCallback callback = resolve(call.name(), config);
@@ -458,7 +478,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 		var calls = assistant.getToolCalls();
 		var remaining = IntStream.range(0, calls.size())
 				.filter(i -> !completed.contains(keys.get(i)) && !continuations.isWaiting(keys.get(i)))
-				.mapToObj(i -> new ToolDispatch(keys.get(i), calls.get(i))).toList();
+				.mapToObj(i -> new ToolDispatch(keys.get(i), calls.get(i), i)).toList();
 
 		var batch = remaining.isEmpty() ? new ToolBatch(Map.of(), Map.of())
 				: executeToolCalls(remaining, state, config, execution);
@@ -474,12 +494,18 @@ public class AgentToolNode implements NodeActionWithConfig {
 			}
 			else if (outcome != null) {
 				var response = outcome.response();
-				responses.add(ToolCallResults.withCallKey(response.toToolResultPart(), key));
-				returnDirect = shouldReturnDirect(response, returnDirect, execution);
+				boolean direct = shouldReturnDirect(response, execution);
+				var result = ToolCallResults.withCallKey(response.toToolResultPart(), key);
+				responses.add(this.toolResultArchive != null && !direct
+						? this.toolResultArchive.archive(config, this.agentName, key, result) : result);
+				returnDirect = !Boolean.FALSE.equals(returnDirect) && direct;
 			}
 		}
 
 		var updates = new HashMap<>(batch.updates());
+		if (pending.isEmpty()) {
+			HumanInTheLoopHook.removeConfirmedCalls(state, agentName, updates);
+		}
 		if (!pending.isEmpty() || continuations.hasSavedState()) {
 			updates.put(pendingAgentToolsStateKey, pending.isEmpty() ? OverAllState.MARK_FOR_REMOVAL
 					: continuations.save(pending, returnDirect));
@@ -507,9 +533,9 @@ public class AgentToolNode implements NodeActionWithConfig {
 				.map(AgentToolContinuations.PausedCall::interruption).toList());
 		return new NodePause(interruption).withUpdates(result);
 	}
-	private Boolean shouldReturnDirect(ToolCallResponse response, Boolean returnDirect, ToolExecution execution) {
+	private boolean shouldReturnDirect(ToolCallResponse response, ToolExecution execution) {
 		ToolCallback callback = response.isError() ? null : execution.resolve().apply(response.getToolName());
-		return !Boolean.FALSE.equals(returnDirect) && callback != null && callback.getToolMetadata().returnDirect();
+		return callback != null && callback.getToolMetadata().returnDirect();
 	}
 
 	/**
@@ -564,10 +590,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 					.build();
 			}
 
-			var requested = new AssistantMessage.ToolCall(req.getToolCallId(), toolCall.type(),
-					req.getToolName(), req.getArguments());
-			if (continuation == null && CONFIRMATION_POLICY.requiresConfirmation(requested, toolCallback.getToolMetadata())
-					&& (!toolCall.equals(requested) || !HumanInTheLoopHook.isConfirmed(config, requested))) {
+			if (continuation == null && requiresUnresolvedConfirmation(dispatch, req, toolCallback, state, config)) {
 				return ToolCallResponse.error(req.getToolCallId(), req.getToolName(), "Tool call requires confirmation");
 			}
 
@@ -599,15 +622,41 @@ public class AgentToolNode implements NodeActionWithConfig {
 				toolContextMap.put(AGENT_TOOL_CALL_ID_CONTEXT_KEY, dispatch.key());
 			}
 
-			// Route to async or sync execution based on callback type
+			var scope = config.eventContext().map(events -> events.child(RunEvent.ScopeKind.TOOL, req.getToolName()))
+					.orElse(null);
+			var scopedConfig = scope == null ? config : config.withEventContext(scope);
+			var toolEvents = new ToolEvents(scope, req, dispatch.index());
+			if (scope != null) {
+				toolContextMap.put(AGENT_CONFIG_CONTEXT_KEY, scopedConfig);
+				toolEvents.emit(RunEvent.Type.TOOL_STARTED, scope.options().includeToolArguments() ? req.getArguments() : null);
+			}
 			try {
-				return executeToolByType(toolCallback, req, toolContextMap, config, extraStateFromToolCall,
-						inParallelExecution, cancellationTokens, toolIndex, execution.cancellation());
+				var response = executeToolByType(toolCallback, req, toolContextMap, scopedConfig, extraStateFromToolCall,
+						inParallelExecution, cancellationTokens, toolIndex, execution.cancellation(), toolEvents);
+				boolean cancelled = execution.cancellation().isCancelled() || Thread.currentThread().isInterrupted();
+				boolean failed = response.isError() || toolEvents.failure != null;
+				if ((failed || cancelled) && toolCallback instanceof StreamingToolCallback) {
+					extraStateFromToolCall.clear();
+				}
+				toolEvents.emit(cancelled ? RunEvent.Type.TOOL_CANCELLED
+						: failed ? RunEvent.Type.TOOL_FAILED : RunEvent.Type.TOOL_COMPLETED,
+						cancelled ? null : toolEvents.failure == null ? response.getResult() : toolEvents.failure);
+				return response;
 			}
 			catch (AgentTool.Interrupted interrupted) {
 				pause.set(AgentToolContinuations.PausedCall.from(interrupted, req.getToolName(), req.getArguments()));
 				pauseSignal.set(interrupted);
+				toolEvents.emit(RunEvent.Type.TOOL_PAUSED, interrupted.interruption().interruptionId().orElse(null));
 				throw interrupted;
+			}
+			catch (RuntimeException error) {
+				toolEvents.emit(RunEvent.Type.TOOL_FAILED, RunEventContext.failure(error));
+				throw error;
+			}
+			finally {
+				if (scope != null) {
+					scope.close();
+				}
 			}
 		};
 
@@ -628,6 +677,23 @@ public class AgentToolNode implements NodeActionWithConfig {
 		}
 		extraStateFromToolCall.clear();
 		return new ToolOutcome(null, pause.get());
+	}
+
+	private boolean requiresUnresolvedConfirmation(ToolDispatch dispatch, ToolCallRequest request,
+			ToolCallback callback, OverAllState state, RunnableConfig config) {
+		var call = dispatch.call();
+		var requested = new AssistantMessage.ToolCall(request.getToolCallId(), call.type(), request.getToolName(),
+				request.getArguments());
+		var priorApproval = HumanInTheLoopHook.matchesSavedApproval(state, agentName, dispatch.key(), requested);
+		if (priorApproval.isPresent()) {
+			return !priorApproval.get();
+		}
+		boolean metadataRequiresReview = CONFIRMATION_POLICY.requiresConfirmation(requested, callback.getToolMetadata());
+		if (call.equals(requested)) {
+			return metadataRequiresReview;
+		}
+		return metadataRequiresReview || configuredToolReview.test(ToolCallRequest.builder(request)
+				.executionContext(new ToolCallExecutionContext(config, state)).build());
 	}
 
 	/**
@@ -675,11 +741,11 @@ public class AgentToolNode implements NodeActionWithConfig {
 	private ToolCallResponse executeToolByType(ToolCallback toolCallback, ToolCallRequest request,
 			Map<String, Object> toolContextMap, RunnableConfig config, Map<String, Object> extraStateFromToolCall,
 			boolean inParallelExecution, Map<Integer, DefaultCancellationToken> cancellationTokens, int toolIndex,
-			CancellationToken cancellation) {
+			CancellationToken cancellation, ToolEvents events) {
 
 		if (toolCallback instanceof AsyncToolCallback async) {
 			return executeAsyncTool(async, request, toolContextMap, config, extraStateFromToolCall, cancellationTokens,
-					toolIndex, cancellation);
+					toolIndex, cancellation, events);
 		}
 		else if (wrapSyncToolsAsAsync && !inParallelExecution) {
 			// Wrap sync tool as async for unified async execution
@@ -690,10 +756,10 @@ public class AgentToolNode implements NodeActionWithConfig {
 			AsyncToolCallback wrappedAsync = AsyncToolCallbackAdapter.wrapIfNeeded(toolCallback, executor,
 					toolExecutionTimeout);
 			return executeAsyncTool(wrappedAsync, request, toolContextMap, config, extraStateFromToolCall,
-					cancellationTokens, toolIndex, cancellation);
+					cancellationTokens, toolIndex, cancellation, events);
 		}
 		else {
-			return executeSyncTool(toolCallback, request, toolContextMap, config);
+			return executeSyncTool(toolCallback, request, toolContextMap, config, events);
 		}
 	}
 
@@ -725,7 +791,8 @@ public class AgentToolNode implements NodeActionWithConfig {
 	 */
 	private ToolCallResponse executeAsyncTool(AsyncToolCallback callback, ToolCallRequest request,
 			Map<String, Object> toolContextMap, RunnableConfig config, Map<String, Object> extraStateFromToolCall,
-			Map<Integer, DefaultCancellationToken> cancellationTokens, int toolIndex, CancellationToken cancellation) {
+			Map<Integer, DefaultCancellationToken> cancellationTokens, int toolIndex, CancellationToken cancellation,
+			ToolEvents events) {
 
 		ToolContext context = new ToolContext(toolContextMap);
 
@@ -743,7 +810,12 @@ public class AgentToolNode implements NodeActionWithConfig {
 				if (cancellationTokens != null && toolIndex >= 0) {
 					cancellationTokens.put(toolIndex, cancellationToken);
 				}
-				future = cancellable.callAsync(request.getArguments(), context, cancellationToken);
+				if (callback instanceof StreamingToolCallback streaming) {
+					future = streaming.callAsync(request.getArguments(), context, cancellationToken, events::delta);
+				}
+				else {
+					future = cancellable.callAsync(request.getArguments(), context, cancellationToken);
+				}
 			}
 			else {
 				future = callback.callAsync(request.getArguments(), context);
@@ -785,6 +857,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 				return ToolCallResponse.error(request.getToolCallId(), request.getToolName(), extractErrorMessage(cause));
 			}
 			else if (cause instanceof ToolExecutionException toolExecutionException) {
+				events.failed(toolExecutionException);
 				logger.error("Async tool {} execution failed, handling with processor: {}", request.getToolName(),
 						toolExecutionExceptionProcessor.getClass().getName(), toolExecutionException);
 				String result = toolExecutionExceptionProcessor.process(toolExecutionException);
@@ -812,7 +885,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 	 * Execute a sync tool with exception handling.
 	 */
 	private ToolCallResponse executeSyncTool(ToolCallback callback, ToolCallRequest request,
-			Map<String, Object> toolContextMap, RunnableConfig config) {
+			Map<String, Object> toolContextMap, RunnableConfig config, ToolEvents events) {
 
 		ToolContext context = new ToolContext(toolContextMap);
 
@@ -833,6 +906,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 			throw e;
 		}
 		catch (ToolExecutionException e) {
+			events.failed(e);
 			logger.error("Tool {} execution failed, handling with processor: {}", request.getToolName(),
 					toolExecutionExceptionProcessor.getClass().getName(), e);
 			String result = toolExecutionExceptionProcessor.process(e);
@@ -882,8 +956,14 @@ public class AgentToolNode implements NodeActionWithConfig {
 			return null;
 		}
 		return RequestToolScope.isScoped(message)
-				? RequestToolScope.resolve(message, agentName, toolName, config, resolveRegistered(toolName))
+				? RequestToolScope.resolve(message, agentName, toolName, config, () -> resolveBound(toolName))
 				: resolve(toolName, config);
+	}
+
+	private ToolCallback resolveBound(String toolName) {
+		ToolCallback registered = resolveRegistered(toolName);
+		return registered == null && this.deferredToolCatalog != null
+				? this.deferredToolCatalog.resolve(toolName) : registered;
 	}
 
 	private ToolCallback resolveRegistered(String toolName) {
@@ -928,7 +1008,41 @@ public class AgentToolNode implements NodeActionWithConfig {
 			AgentToolContinuations continuations, CancellationToken cancellation) {
 	}
 
-	private record ToolDispatch(String key, AssistantMessage.ToolCall call) {
+	private static final class ToolEvents {
+
+		private final RunEventContext scope;
+		private final ToolCallRequest request;
+		private final int index;
+		private RunEvent.Failure failure;
+
+		private ToolEvents(RunEventContext scope, ToolCallRequest request, int index) {
+			this.scope = scope;
+			this.request = request;
+			this.index = index;
+		}
+
+		private void emit(RunEvent.Type type, Object value) {
+			if (scope != null) {
+				scope.emit(type, payload(value));
+			}
+		}
+
+		private Mono<Void> delta(Object value) {
+			return scope == null ? Mono.empty() : scope.emitReactive(RunEvent.Type.TOOL_DELTA, payload(value));
+		}
+
+		private void failed(Throwable cause) {
+			if (scope != null) {
+				failure = RunEventContext.failure(cause);
+			}
+		}
+
+		private RunEvent.Tool payload(Object value) {
+			return new RunEvent.Tool(request.getToolCallId(), index, request.getToolName(), value);
+		}
+	}
+
+	private record ToolDispatch(String key, AssistantMessage.ToolCall call, int index) {
 	}
 
 	private record ToolOutcome(ToolCallResponse response, AgentToolContinuations.PausedCall pause) {
@@ -994,6 +1108,10 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 		private String agentName;
 
+		private ToolResultArchive toolResultArchive;
+
+		private DeferredToolCatalog deferredToolCatalog;
+
 		private boolean enableActingLog;
 
 		private boolean parallelToolExecution = false;
@@ -1020,6 +1138,16 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 		public Builder agentName(String agentName) {
 			this.agentName = agentName;
+			return this;
+		}
+
+		public Builder toolResultArchive(ToolResultArchive toolResultArchive) {
+			this.toolResultArchive = toolResultArchive;
+			return this;
+		}
+
+		public Builder deferredToolCatalog(DeferredToolCatalog deferredToolCatalog) {
+			this.deferredToolCatalog = deferredToolCatalog;
 			return this;
 		}
 

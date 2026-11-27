@@ -17,15 +17,18 @@ package com.alibaba.cloud.ai.graph;
 
 import com.alibaba.cloud.ai.graph.action.AsyncNodeActionWithConfig;
 import com.alibaba.cloud.ai.graph.action.Command;
+import com.alibaba.cloud.ai.graph.action.InterruptionMetadata;
 import com.alibaba.cloud.ai.graph.internal.edge.EdgeValue;
 import com.alibaba.cloud.ai.graph.checkpoint.Checkpoint;
 import com.alibaba.cloud.ai.graph.checkpoint.CheckpointWrite;
+import com.alibaba.cloud.ai.graph.checkpoint.InterruptionCheckpointCodec;
 import com.alibaba.cloud.ai.graph.exception.RunnableErrors;
 import com.alibaba.cloud.ai.graph.internal.ParallelBranchPath;
 import com.alibaba.cloud.ai.graph.internal.node.ParallelNode;
 import com.alibaba.cloud.ai.graph.internal.node.ResumableSubGraphAction;
 import com.alibaba.cloud.ai.graph.state.StateSnapshot;
 import com.alibaba.cloud.ai.graph.streaming.OutputType;
+import com.alibaba.cloud.ai.graph.streaming.RunEvent;
 import com.alibaba.cloud.ai.graph.streaming.StreamingOutput;
 import com.alibaba.cloud.ai.graph.utils.SystemClock;
 import com.alibaba.cloud.ai.graph.utils.TypeRef;
@@ -70,6 +73,8 @@ public class GraphRunnerContext {
 	// A false value records a checkpoint taken before the child ran. Older checkpoints have no flag.
 	static final String SUBGRAPH_PAUSED = "_graph_subgraph_paused_";
 
+	private static final String PENDING_INTERRUPTION = "_graph_pending_interruption_";
+
 	private static final Logger log = LoggerFactory.getLogger(GraphRunner.class);
 
 	final CompiledGraph compiledGraph;
@@ -77,6 +82,8 @@ public class GraphRunnerContext {
 	final AtomicInteger iteration = new AtomicInteger(0);
 
 	private final ParallelBranchPath branchPath;
+
+	private final boolean snapshotNodeOutputs;
 
 	private final List<Map<String, Object>> branchWrites = new ArrayList<>();
 
@@ -104,14 +111,16 @@ public class GraphRunnerContext {
 
 	public GraphRunnerContext(OverAllState initialState, RunnableConfig config, CompiledGraph compiledGraph)
 			throws Exception {
-		this(initialState, config, compiledGraph, null);
+		this(initialState, config, compiledGraph, null, true);
 	}
 
 	GraphRunnerContext(OverAllState initialState, RunnableConfig config, CompiledGraph compiledGraph,
-			ParallelBranchPath branchPath) throws Exception {
+			ParallelBranchPath branchPath, boolean nodeOutputsRequested) throws Exception {
 		this.compiledGraph = compiledGraph;
 		this.config = config;
 		this.branchPath = branchPath;
+		this.snapshotNodeOutputs = nodeOutputsRequested
+				|| config.eventContext().filter(events -> events.enabled(RunEvent.Channel.VALUES)).isPresent();
 		this.captureWrites = branchPath != null || isEmbeddedRun();
 
 		// Decide whether this run continues from a persisted checkpoint or starts over
@@ -313,10 +322,10 @@ public class GraphRunnerContext {
 	// ================================================================================================================
 
 	public Optional<Checkpoint> addCheckpoint(String nodeId, String nextNodeId) throws Exception {
-		return addCheckpoint(nodeId, nextNodeId, false);
+		return addCheckpoint(nodeId, nextNodeId, Map.of());
 	}
 
-	private Optional<Checkpoint> addCheckpoint(String nodeId, String nextNodeId, boolean subgraphPaused)
+	private Optional<Checkpoint> addCheckpoint(String nodeId, String nextNodeId, Map<String, Object> runtimeUpdate)
 			throws Exception {
 		if (branchPath != null && !compiledGraph.compileConfig.taskCheckpoints()) {
 			return Optional.empty();
@@ -326,8 +335,9 @@ public class GraphRunnerContext {
 					.build();
 			var runtime = new HashMap<>(branchCompletionMetadata());
 			if (compiledGraph.isCompiledSubgraph(nextNodeId)) {
-				runtime.put(SUBGRAPH_PAUSED, subgraphPaused);
+				runtime.put(SUBGRAPH_PAUSED, false);
 			}
+			runtime.putAll(runtimeUpdate);
 			if (!runtime.isEmpty()) {
 				cp = cp.withRuntimeData(runtime);
 			}
@@ -337,6 +347,7 @@ public class GraphRunnerContext {
 			this.config = compiledGraph.compileConfig.checkpointSaver().get().put(appendConfig, cp);
 			this.currentCheckpoint = cp;
 			this.replayingHistoricalCheckpoint = false;
+			emitCheckpoint(cp);
 			return Optional.of(cp);
 		}
 		return Optional.empty();
@@ -347,34 +358,51 @@ public class GraphRunnerContext {
 	}
 
 	public void checkpointPausedNode() throws Exception {
-		checkpointPausedNode(false);
+		checkpointPausedNode(Map.of());
+	}
+
+	public void checkpointPendingInterruption(InterruptionMetadata interruption) throws Exception {
+		checkpointPausedNode(Map.of(PENDING_INTERRUPTION, InterruptionCheckpointCodec.encodeRequest(interruption)));
+	}
+
+	@SuppressWarnings("unchecked")
+	public Optional<InterruptionMetadata> pendingInterruption(OverAllState state) {
+		if (currentCheckpoint != null && currentCheckpoint.getNextNodeId().equals(currentNodeId)
+				&& currentCheckpoint.runtimeData().get(PENDING_INTERRUPTION) instanceof Map<?, ?> request) {
+			return Optional.of(InterruptionCheckpointCodec.decodeRequest((Map<String, Object>) request, state));
+		}
+		return Optional.empty();
 	}
 
 	public void checkpointPausedSubgraph() throws Exception {
 		if (compiledGraph.isCompiledSubgraph(currentNodeId)) {
-			checkpointPausedNode(true);
+			checkpointPausedNode(Map.of(SUBGRAPH_PAUSED, true));
 		}
 	}
 
-	private void checkpointPausedNode(boolean subgraphPaused) throws Exception {
+	private void checkpointPausedNode(Map<String, Object> runtimeUpdate) throws Exception {
 		var saver = compiledGraph.compileConfig.checkpointSaver();
 		if (saver.isEmpty()) {
 			return;
 		}
 		if (currentCheckpoint == null || replayingHistoricalCheckpoint
 				|| !currentNodeId.equals(currentCheckpoint.getNextNodeId())) {
-			addCheckpoint(currentNodeId, currentNodeId, subgraphPaused);
+			addCheckpoint(currentNodeId, currentNodeId, runtimeUpdate);
 			return;
 		}
 		var runtime = new HashMap<>(currentCheckpoint.runtimeData());
 		runtime.putAll(branchCompletionMetadata());
-		if (subgraphPaused) {
-			runtime.put(SUBGRAPH_PAUSED, true);
-		}
+		runtime.putAll(runtimeUpdate);
 		var checkpoint = Checkpoint.builder().id(currentCheckpoint.getId()).nodeId(currentCheckpoint.getNodeId())
 				.nextNodeId(currentNodeId).state(cloneState(overallState.data())).build().withRuntimeData(runtime);
 		saver.get().put(config.withCheckPointId(checkpoint.getId()), checkpoint);
 		currentCheckpoint = checkpoint;
+		emitCheckpoint(checkpoint);
+	}
+
+	private void emitCheckpoint(Checkpoint checkpoint) {
+		config.eventContext().ifPresent(events -> events.emit(RunEvent.Type.CHECKPOINT_SAVED,
+				new RunEvent.Checkpoint(checkpoint.getId(), checkpoint.getNodeId(), checkpoint.getNextNodeId())));
 	}
 
 	/**
@@ -391,8 +419,18 @@ public class GraphRunnerContext {
 		return canWriteTaskProgress() ? currentCheckpoint.runtimeData() : Map.of();
 	}
 
+	public synchronized Map<String, Object> stepPauseData() {
+		return canAccessStepCheckpoint() ? currentCheckpoint.runtimeData() : Map.of();
+	}
+
 	public synchronized void updateStepCheckpoint(UnaryOperator<Map<String, Object>> update) {
-		if (!canWriteTaskProgress()) {
+		if (canWriteTaskProgress()) {
+			updateStepPauseCheckpoint(update);
+		}
+	}
+
+	public synchronized void updateStepPauseCheckpoint(UnaryOperator<Map<String, Object>> update) {
+		if (!canAccessStepCheckpoint()) {
 			return;
 		}
 		try {
@@ -407,7 +445,11 @@ public class GraphRunnerContext {
 	}
 
 	private boolean canWriteTaskProgress() {
-		return compiledGraph.compileConfig.taskCheckpoints() && currentCheckpoint != null
+		return compiledGraph.compileConfig.taskCheckpoints() && canAccessStepCheckpoint();
+	}
+
+	private boolean canAccessStepCheckpoint() {
+		return currentCheckpoint != null
 				&& !replayingHistoricalCheckpoint && currentCheckpoint.getNextNodeId().equals(currentNodeId);
 	}
 
@@ -454,12 +496,17 @@ public class GraphRunnerContext {
 		return NodeOutput.of(
 				nodeId,
 				(String) config.metadata("_AGENT_").orElse(""),
-				cloneState(this.overallState.data()),
+				nodeOutputState(),
 				this.tokenUsage);
 	}
 
 	public OverAllState cloneState(Map<String, Object> data) throws Exception {
 		return compiledGraph.cloneState(data);
+	}
+
+	private OverAllState nodeOutputState() throws Exception {
+		// A root event stream discards legacy node outputs. Only requested views need snapshots.
+		return snapshotNodeOutputs ? cloneState(overallState.data()) : overallState;
 	}
 
 	// ================================================================================================================
@@ -604,6 +651,11 @@ public class GraphRunnerContext {
 		return result;
 	}
 
+	public Optional<InterruptionMetadata> pendingEmbeddedInterruption() {
+		return ofNullable(returnFromEmbed).map(ReturnFromEmbed::value).filter(InterruptionMetadata.class::isInstance)
+				.map(InterruptionMetadata.class::cast);
+	}
+
 	public void setReturnFromEmbedWithValue(Object value) {
 		returnFromEmbed = new ReturnFromEmbed(value);
 	}
@@ -661,10 +713,10 @@ public class GraphRunnerContext {
 
 		if (message != null) {
 			return new StreamingOutput<>(message, nodeId, (String) config.metadata("_AGENT_").orElse(""),
-					cloneState(this.overallState.data()), tokenUsage, outputType);
+					nodeOutputState(), tokenUsage, outputType);
 		} else {
 			return new StreamingOutput<>(nodeId, (String) config.metadata("_AGENT_").orElse(""),
-					cloneState(this.overallState.data()), tokenUsage, outputType);
+					nodeOutputState(), tokenUsage, outputType);
 		}
 	}
 

@@ -15,6 +15,8 @@
  */
 package com.alibaba.cloud.ai.graph.agent;
 
+import com.alibaba.cloud.ai.graph.agent.context.ToolResultArchive;
+
 import com.alibaba.cloud.ai.graph.agent.extension.interceptor.AssistantMessageSanitizerInterceptor;
 import com.alibaba.cloud.ai.graph.agent.hook.Hook;
 import com.alibaba.cloud.ai.graph.agent.interceptor.Interceptor;
@@ -22,6 +24,8 @@ import com.alibaba.cloud.ai.graph.agent.interceptor.ModelInterceptor;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolInterceptor;
 import com.alibaba.cloud.ai.graph.agent.node.AgentLlmNode;
 import com.alibaba.cloud.ai.graph.agent.node.AgentToolNode;
+import com.alibaba.cloud.ai.graph.agent.structured.StructuredOutputFormat;
+import com.alibaba.cloud.ai.graph.agent.tool.DeferredToolCatalog;
 import com.alibaba.cloud.ai.graph.agent.tool.ToolCallbackUtils;
 import io.micrometer.observation.ObservationRegistry;
 import org.apache.commons.collections4.CollectionUtils;
@@ -35,8 +39,6 @@ import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.ai.converter.BeanOutputConverter;
-import org.springframework.ai.converter.FormatProvider;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
@@ -64,22 +66,24 @@ public class DefaultBuilder extends Builder {
 		}
 
 		// Validate either chatClient or model is provided
-		if (chatClient == null && model == null) {
+		ChatModel defaultModel = model == null && this.modelRoutingPolicy != null
+				? this.modelRoutingPolicy.defaultTarget().model() : model;
+		if (chatClient == null && defaultModel == null) {
 			throw new IllegalArgumentException("Either chatClient or model must be provided");
 		}
 
 		// Get source options from ChatClient (when provided) or from ChatModel (when building from model).
 		ChatOptions sourceOptions = (chatClient != null)
 				? getChatClientDefaultOptions(chatClient)
-				: getChatModelDefaultOptions(model);
+				: getChatModelDefaultOptions(defaultModel);
 		ChatOptions effectiveOptions = mergeSourceOptionsWithAgentOptions(sourceOptions, this.chatOptions);
 
 		if (chatClient == null) {
-			ChatModel effectiveModel = withDefaultOptions(model, effectiveOptions);
+			ChatModel effectiveModel = withDefaultOptions(defaultModel, effectiveOptions);
 			ChatClient.Builder clientBuilder = ChatClient.builder(effectiveModel,
 					this.observationRegistry == null ? ObservationRegistry.NOOP : this.observationRegistry,
 					this.customObservationConvention, this.advisorObservationConvention);
-			if (effectiveOptions != null && effectiveModel == model) {
+			if (effectiveOptions != null && effectiveModel == defaultModel) {
 				clientBuilder.defaultOptions(effectiveOptions.mutate());
 			}
 			chatClient = clientBuilder.build();
@@ -97,6 +101,7 @@ public class DefaultBuilder extends Builder {
 				.agentName(this.name)
 				.chatOptions(effectiveOptions)
 				.contextWindowPolicy(this.contextWindowPolicy)
+				.modelRouting(this.modelRoutingPolicy)
 				.chatClient(chatClient);
 
 		if (outputKey != null && !outputKey.isEmpty()) {
@@ -107,6 +112,8 @@ public class DefaultBuilder extends Builder {
 			llmNodeBuilder.systemPrompt(systemPrompt);
 		}
 
+		llmNodeBuilder.checkpointContextCompaction(this.checkpointContextCompaction);
+
 		if (templateRenderer != null) {
 			llmNodeBuilder.templateRenderer(templateRenderer);
     }
@@ -115,17 +122,9 @@ public class DefaultBuilder extends Builder {
 			llmNodeBuilder.instruction(instruction);
 		}
 
-		String outputSchema = null;
-		if (StringUtils.hasLength(this.outputSchema) ) {
-			outputSchema = this.outputSchema;
-		} else if (this.outputType != null) {
-			FormatProvider formatProvider = new BeanOutputConverter<>(this.outputType);
-			outputSchema = formatProvider.getFormat();
-		}
-
-		if (StringUtils.hasLength(outputSchema)) {
-			llmNodeBuilder.outputSchema(outputSchema);
-		}
+		var structuredOutput = StructuredOutputFormat.from(this.outputSchema, this.outputType,
+				this.structuredOutputStrategy, this.structuredOutputMaxRetries);
+		llmNodeBuilder.outputSchema(this.outputSchema).structuredOutput(structuredOutput);
 		
 		separateInterceptorsByType();
 
@@ -137,7 +136,32 @@ public class DefaultBuilder extends Builder {
 		List<ToolCallback> allTools = ToolCallbackUtils.deduplicateByName(gatherLocalTools(),
 				effectiveOptions instanceof ToolCallingChatOptions options ? options.getToolCallbacks() : null,
 				clientTools);
+		if (structuredOutput != null && allTools.stream().anyMatch(
+				tool -> StructuredOutputFormat.RESULT_TOOL_NAME.equals(tool.getToolDefinition().name()))) {
+			throw new IllegalArgumentException("Tool name is reserved for structured output: "
+					+ StructuredOutputFormat.RESULT_TOOL_NAME);
+		}
+		if (this.toolResultArchive != null) {
+			if (allTools.stream().anyMatch(tool -> ToolResultArchive.READ_TOOL_NAME.equals(tool.getToolDefinition().name()))) {
+				throw new IllegalArgumentException("Tool name is reserved by the result archive: "
+						+ ToolResultArchive.READ_TOOL_NAME);
+			}
+			allTools = new ArrayList<>(allTools);
+			allTools.add(this.toolResultArchive.createReadTool(this.name));
+		}
 		
+		if (this.deferredToolCatalog != null) {
+			for (ToolCallback tool : allTools) {
+				String name = tool.getToolDefinition().name();
+				if (DeferredToolCatalog.DISCOVERY_TOOLS.contains(name) || this.deferredToolCatalog.names().contains(name)) {
+					throw new IllegalArgumentException("Duplicate deferred tool name: " + name);
+				}
+			}
+			allTools = new ArrayList<>(allTools);
+			allTools.addAll(this.deferredToolCatalog.discoveryTools(this.name));
+			llmNodeBuilder.deferredToolCatalog(this.deferredToolCatalog);
+		}
+
 		// Set combined tools to LLM node
 		if (CollectionUtils.isNotEmpty(allTools)) {
 			llmNodeBuilder.toolCallbacks(Collections.unmodifiableList(allTools));
@@ -153,6 +177,8 @@ public class DefaultBuilder extends Builder {
 		AgentToolNode toolNode;
 		AgentToolNode.Builder toolBuilder = AgentToolNode.builder()
 				.agentName(this.name)
+				.toolResultArchive(this.toolResultArchive)
+				.deferredToolCatalog(this.deferredToolCatalog)
 				.parallelToolExecution(this.parallelToolExecution)
 				.maxParallelTools(this.maxParallelTools)
 				.toolCallLimits(this.maxCallsPerTool, this.maxTotalToolCalls)

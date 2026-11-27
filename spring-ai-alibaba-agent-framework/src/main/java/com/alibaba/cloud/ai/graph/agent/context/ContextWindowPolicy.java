@@ -20,6 +20,7 @@ import java.util.function.Predicate;
 import java.util.function.ToIntFunction;
 
 import com.alibaba.cloud.ai.graph.agent.hook.TokenCounter;
+import com.alibaba.cloud.ai.graph.agent.tool.ToolCallbackUtils;
 
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.StructuredOutputChatOptions;
@@ -35,6 +36,8 @@ public final class ContextWindowPolicy {
 
 	private final int maxInputTokens;
 
+	private final ModelCapacity capacity;
+
 	private final int targetInputTokens;
 
 	private final ToIntFunction<Prompt> inputTokenEstimator;
@@ -43,17 +46,27 @@ public final class ContextWindowPolicy {
 
 	private ContextWindowPolicy(Builder builder) {
 		this.maxInputTokens = builder.maxInputTokens;
+		this.capacity = builder.capacity;
 		this.targetInputTokens = builder.targetInputTokens;
 		this.inputTokenEstimator = builder.inputTokenEstimator;
 		this.inputOverflowDetector = builder.inputOverflowDetector;
 	}
 
 	public static Builder builder(int maxInputTokens) {
-		return new Builder(maxInputTokens);
+		return new Builder(maxInputTokens, null);
+	}
+
+	public static Builder builder(ModelCapacity capacity) {
+		Objects.requireNonNull(capacity, "capacity must not be null");
+		return new Builder(capacity.inputLimit(null), capacity);
 	}
 
 	public int maxInputTokens() {
 		return this.maxInputTokens;
+	}
+
+	public int inputLimit(Prompt prompt) {
+		return this.capacity == null ? this.maxInputTokens : this.capacity.inputLimit(prompt.getOptions());
 	}
 
 	public int targetInputTokens() {
@@ -82,9 +95,7 @@ public final class ContextWindowPolicy {
 		long tokens = MESSAGE_TOKENS.countTokens(prompt.getInstructions()) + 4L * messages + 3;
 		if (prompt.getOptions() instanceof ToolCallingChatOptions options && options.getToolCallbacks() != null) {
 			for (var callback : options.getToolCallbacks()) {
-				var definition = callback.getToolDefinition();
-				tokens += 4L + textTokens(definition.name()) + textTokens(definition.description())
-						+ textTokens(definition.inputSchema());
+				tokens += ToolCallbackUtils.estimateSchemaTokens(callback.getToolDefinition());
 			}
 		}
 		if (prompt.getOptions() instanceof StructuredOutputChatOptions options) {
@@ -101,17 +112,20 @@ public final class ContextWindowPolicy {
 
 		private final int maxInputTokens;
 
+		private final ModelCapacity capacity;
+
 		private int targetInputTokens;
 
 		private ToIntFunction<Prompt> inputTokenEstimator = ContextWindowPolicy::estimateTextInput;
 
 		private Predicate<Throwable> inputOverflowDetector = error -> false;
 
-		private Builder(int maxInputTokens) {
+		private Builder(int maxInputTokens, ModelCapacity capacity) {
 			if (maxInputTokens < 1) {
 				throw new IllegalArgumentException("maxInputTokens must be positive");
 			}
 			this.maxInputTokens = maxInputTokens;
+			this.capacity = capacity;
 			this.targetInputTokens = maxInputTokens;
 		}
 

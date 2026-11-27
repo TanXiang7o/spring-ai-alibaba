@@ -27,17 +27,22 @@ import java.util.concurrent.Executor;
 
 import com.alibaba.cloud.ai.graph.CompileConfig;
 import com.alibaba.cloud.ai.graph.KeyStrategy;
+import com.alibaba.cloud.ai.graph.agent.context.CheckpointContextCompaction;
 import com.alibaba.cloud.ai.graph.agent.context.ContextWindowPolicy;
+import com.alibaba.cloud.ai.graph.agent.context.ToolResultArchive;
 import com.alibaba.cloud.ai.graph.agent.hook.Hook;
 import com.alibaba.cloud.ai.graph.agent.interceptor.Interceptor;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ModelInterceptor;
 import com.alibaba.cloud.ai.graph.agent.interceptor.StreamingModelInterceptor;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolInterceptor;
+import com.alibaba.cloud.ai.graph.agent.model.ModelRoutingPolicy;
+import com.alibaba.cloud.ai.graph.agent.structured.StructuredOutputStrategy;
 import com.alibaba.cloud.ai.graph.checkpoint.BaseCheckpointSaver;
 import com.alibaba.cloud.ai.graph.checkpoint.config.SaverConfig;
 
 import com.alibaba.cloud.ai.graph.serializer.StateSerializer;
 import com.alibaba.cloud.ai.graph.serializer.std.SpringAIStateSerializer;
+import com.alibaba.cloud.ai.graph.agent.tool.DeferredToolCatalog;
 import io.micrometer.observation.ObservationRegistry;
 
 import org.springframework.ai.chat.client.ChatClient;
@@ -67,19 +72,27 @@ public abstract class Builder {
 
 	protected String systemPrompt;
 
+	protected CheckpointContextCompaction checkpointContextCompaction;
+
 	// Provide customized template renderer instance, for example
 	// SaaStTemplateRenderer.builder().startDelimiterToken("{{").endDelimiterToken("}}").build()
 	protected TemplateRenderer templateRenderer;
 
 	protected ChatModel model;
 
+	protected ModelRoutingPolicy modelRoutingPolicy;
+
 	protected ChatOptions chatOptions;
 
 	protected ContextWindowPolicy contextWindowPolicy;
 
+	protected ToolResultArchive toolResultArchive;
+
 	protected ChatClient chatClient;
 
 	protected List<ToolCallback> tools = new ArrayList<>();
+
+	protected DeferredToolCatalog deferredToolCatalog;
 
 	protected List<ToolCallbackProvider> toolCallbackProviders = new ArrayList<>();
 
@@ -120,6 +133,10 @@ public abstract class Builder {
 	protected String outputSchema;
 	protected Class<?> outputType;
 
+	protected StructuredOutputStrategy structuredOutputStrategy = StructuredOutputStrategy.AUTO;
+
+	protected int structuredOutputMaxRetries = 2;
+
 	protected ObservationRegistry observationRegistry;
 
 	protected ChatClientObservationConvention customObservationConvention;
@@ -157,6 +174,12 @@ public abstract class Builder {
 		return this;
 	}
 
+	/** Selects a model once per execution and persists the route for checkpoint resume. */
+	public Builder modelRouting(ModelRoutingPolicy policy) {
+		this.modelRoutingPolicy = Objects.requireNonNull(policy, "model routing policy must not be null");
+		return this;
+	}
+
 	public Builder chatOptions(ChatOptions chatOptions) {
 		this.chatOptions = chatOptions;
 		return this;
@@ -173,6 +196,12 @@ public abstract class Builder {
 		Assert.notNull(tools, "tools cannot be null");
 		Assert.noNullElements(tools, "tools cannot contain null elements");
 		this.tools.addAll(List.of(tools));
+		return this;
+	}
+
+	/** Adds tools that become available after the model discovers and loads them. */
+	public Builder deferredTools(DeferredToolCatalog catalog) {
+		this.deferredToolCatalog = Objects.requireNonNull(catalog, "deferred tool catalog must not be null");
 		return this;
 	}
 
@@ -247,6 +276,17 @@ public abstract class Builder {
 		return this;
 	}
 
+	/**
+	 * Summarizes completed turns for the model while retaining the full message history.
+	 * Use a durable checkpoint saver to restore summaries after a restart.
+	 * @param compaction the checkpoint compaction policy
+	 * @return this builder instance
+	 */
+	public Builder checkpointContextCompaction(CheckpointContextCompaction compaction) {
+		this.checkpointContextCompaction = Objects.requireNonNull(compaction, "compaction must not be null");
+		return this;
+	}
+
 	public Builder templateRenderer(TemplateRenderer templateRenderer) {
 		this.templateRenderer = templateRenderer;
 		return this;
@@ -279,6 +319,21 @@ public abstract class Builder {
 
 	public Builder outputType(Class<?> outputType) {
 		this.outputType = outputType;
+		return this;
+	}
+
+	/** Selects the output strategy. AUTO prefers native JSON Schema, then a result tool, then a prompt. */
+	public Builder structuredOutputStrategy(StructuredOutputStrategy strategy) {
+		this.structuredOutputStrategy = Objects.requireNonNull(strategy, "Structured output strategy is required");
+		return this;
+	}
+
+	/** Sets the number of additional model attempts after an invalid structured answer. */
+	public Builder structuredOutputMaxRetries(int maxRetries) {
+		if (maxRetries < 0) {
+			throw new IllegalArgumentException("Structured output retries must be non-negative");
+		}
+		this.structuredOutputMaxRetries = maxRetries;
 		return this;
 	}
 
@@ -316,6 +371,16 @@ public abstract class Builder {
 	 */
 	public Builder contextWindowPolicy(ContextWindowPolicy policy) {
 		this.contextWindowPolicy = Objects.requireNonNull(policy, "policy must not be null");
+		return this;
+	}
+
+	/**
+	 * Archives oversized tool results and exposes a scoped page-reading tool.
+	 * @param archive the archive policy and backing store
+	 * @return this builder instance
+	 */
+	public Builder toolResultArchive(ToolResultArchive archive) {
+		this.toolResultArchive = Objects.requireNonNull(archive, "archive must not be null");
 		return this;
 	}
 
