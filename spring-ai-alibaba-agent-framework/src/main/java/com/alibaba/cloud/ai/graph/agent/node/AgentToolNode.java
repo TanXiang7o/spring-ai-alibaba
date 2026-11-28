@@ -35,10 +35,13 @@ import com.alibaba.cloud.ai.graph.agent.interceptor.ToolCallResponse;
 import com.alibaba.cloud.ai.graph.agent.hook.hip.HumanInTheLoopHook;
 import com.alibaba.cloud.ai.graph.agent.tool.ToolCallResults;
 import com.alibaba.cloud.ai.graph.agent.interceptor.ToolInterceptor;
+import com.alibaba.cloud.ai.graph.agent.permission.ToolPermissionPolicy;
+import com.alibaba.cloud.ai.graph.agent.permission.ToolPermissionPolicy.Decision;
 import com.alibaba.cloud.ai.graph.agent.tool.AsyncToolCallback;
 import com.alibaba.cloud.ai.graph.agent.tool.AsyncToolCallbackAdapter;
 import com.alibaba.cloud.ai.graph.agent.tool.CancellableAsyncToolCallback;
 import com.alibaba.cloud.ai.graph.agent.tool.CancellationToken;
+import com.alibaba.cloud.ai.graph.agent.tool.ContextSourceTool;
 import com.alibaba.cloud.ai.graph.agent.tool.DeferredToolCatalog;
 import com.alibaba.cloud.ai.graph.agent.tool.DefaultCancellationToken;
 import com.alibaba.cloud.ai.graph.agent.tool.StateAwareToolCallback;
@@ -154,8 +157,11 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 	private ToolExecutionExceptionProcessor toolExecutionExceptionProcessor;
 
+	private final ToolPermissionPolicy toolPermissionPolicy;
+
 	public AgentToolNode(Builder builder) {
 		this.agentName = builder.agentName;
+		this.toolPermissionPolicy = builder.toolPermissionPolicy;
 		this.toolResultArchive = builder.toolResultArchive;
 		this.deferredToolCatalog = builder.deferredToolCatalog;
 		this.budgetStateKey = "_TOOL_CALL_BUDGET_:" + Objects.toString(agentName, "");
@@ -210,6 +216,13 @@ public class AgentToolNode implements NodeActionWithConfig {
 		}
 		return explicitlyConfigured
 				|| (callback != null && CONFIRMATION_POLICY.requiresConfirmation(call, callback.getToolMetadata()));
+	}
+
+	public Decision toolPermission(AssistantMessage message, ToolCallRequest request, RunnableConfig config) {
+		if (toolPermissionPolicy == null || resolve(message, request.getToolName(), config) == null) {
+			return Decision.ALLOW;
+		}
+		return Objects.requireNonNull(toolPermissionPolicy.evaluate(request), "tool permission decision");
 	}
 
 	@Override
@@ -485,7 +498,8 @@ public class AgentToolNode implements NodeActionWithConfig {
 		execution.cancellation().throwIfCancelled();
 		var pending = new LinkedHashMap<String, AgentToolContinuations.PausedCall>();
 		var responses = new ArrayList<>(existing);
-		Boolean returnDirect = continuations.allReturnDirect();
+		Boolean returnDirect = existing.stream().anyMatch(ToolResultPart::isError)
+				? Boolean.FALSE : continuations.allReturnDirect();
 		for (var key : keys) {
 			var outcome = batch.outcomes().get(key);
 			var pause = outcome == null ? continuations.pending().get(key) : outcome.pause();
@@ -567,6 +581,13 @@ public class AgentToolNode implements NodeActionWithConfig {
 				.executionContext(new ToolCallExecutionContext(config, state))
 				.build();
 
+		if (toolPermissionPolicy != null && execution.resolve().apply(request.getToolName()) != null) {
+			var denied = policyError(dispatch, request, state);
+			if (denied != null) {
+				return ToolOutcome.completed(denied);
+			}
+		}
+
 		// Create base handler that actually executes the tool
 		ToolCallHandler baseHandler = req -> {
 			execution.cancellation().throwIfCancelled();
@@ -590,11 +611,20 @@ public class AgentToolNode implements NodeActionWithConfig {
 					.build();
 			}
 
+			if (toolPermissionPolicy != null) {
+				var actualRequest = ToolCallRequest.builder(req).context(config.metadata().orElseGet(Map::of))
+						.executionContext(new ToolCallExecutionContext(config, state)).build();
+				var denied = policyError(dispatch, actualRequest, state);
+				if (denied != null) {
+					return denied;
+				}
+			}
+
 			if (continuation == null && requiresUnresolvedConfirmation(dispatch, req, toolCallback, state, config)) {
 				return ToolCallResponse.error(req.getToolCallId(), req.getToolName(), "Tool call requires confirmation");
 			}
 
-			String limitMessage = continuation == null ? execution.budget().reserve(req.getToolName()) : null;
+			String limitMessage = continuation == null ? execution.budget().reserve(req.getToolName(), toolCallback) : null;
 			if (limitMessage != null) {
 				return ToolCallResponse.error(req.getToolCallId(), req.getToolName(), limitMessage);
 			}
@@ -635,7 +665,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 						inParallelExecution, cancellationTokens, toolIndex, execution.cancellation(), toolEvents);
 				boolean cancelled = execution.cancellation().isCancelled() || Thread.currentThread().isInterrupted();
 				boolean failed = response.isError() || toolEvents.failure != null;
-				if ((failed || cancelled) && toolCallback instanceof StreamingToolCallback) {
+				if (failed || cancelled) {
 					extraStateFromToolCall.clear();
 				}
 				toolEvents.emit(cancelled ? RunEvent.Type.TOOL_CANCELLED
@@ -667,6 +697,9 @@ public class AgentToolNode implements NodeActionWithConfig {
 		try {
 			var response = chainedHandler.call(request);
 			if (pause.get() == null) {
+				if (response.isError()) {
+					extraStateFromToolCall.clear();
+				}
 				return ToolOutcome.completed(response);
 			}
 		}
@@ -677,6 +710,22 @@ public class AgentToolNode implements NodeActionWithConfig {
 		}
 		extraStateFromToolCall.clear();
 		return new ToolOutcome(null, pause.get());
+	}
+
+	private ToolCallResponse policyError(ToolDispatch dispatch, ToolCallRequest request, OverAllState state) {
+		Decision decision = Objects.requireNonNull(toolPermissionPolicy.evaluate(request), "tool permission decision");
+		var original = dispatch.call();
+		if (decision == Decision.DENY) {
+			return ToolCallResponse.permissionDenied(original.id(), original.name());
+		}
+		if (decision == Decision.REVIEW) {
+			var actual = new AssistantMessage.ToolCall(request.getToolCallId(), original.type(), request.getToolName(),
+					request.getArguments());
+			if (!HumanInTheLoopHook.matchesSavedApproval(state, agentName, dispatch.key(), actual).orElse(false)) {
+				return ToolCallResponse.error(original.id(), original.name(), "Tool call requires confirmation");
+			}
+		}
+		return null;
 	}
 
 	private boolean requiresUnresolvedConfirmation(ToolDispatch dispatch, ToolCallRequest request,
@@ -895,7 +944,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 			if (enableActingLog) {
 				logger.info("[ThreadId {}] Agent {} acting, tool {} finished",
 						config.threadId().orElse(THREAD_ID_DEFAULT), agentName, request.getToolName());
-				if (logger.isDebugEnabled()) {
+				if (logger.isDebugEnabled() && !(callback instanceof ContextSourceTool)) {
 					logger.debug("Tool {} returned: {}", request.getToolName(), result);
 				}
 			}
@@ -1032,9 +1081,7 @@ public class AgentToolNode implements NodeActionWithConfig {
 		}
 
 		private void failed(Throwable cause) {
-			if (scope != null) {
-				failure = RunEventContext.failure(cause);
-			}
+			failure = RunEventContext.failure(cause);
 		}
 
 		private RunEvent.Tool payload(Object value) {
@@ -1077,13 +1124,15 @@ public class AgentToolNode implements NodeActionWithConfig {
 			total = counts.values().stream().mapToInt(Integer::intValue).sum();
 		}
 
-		synchronized String reserve(String name) {
+		synchronized String reserve(String name, ToolCallback callback) {
 			if (closed) {
 				return "Tool execution batch has already completed";
 			}
 			int count = counts.getOrDefault(name, 0);
-			if (count >= maxCallsPerTool) {
-				return "Tool call limit (%d) exceeded for tool '%s' in this turn".formatted(maxCallsPerTool, name);
+			int limit = callback instanceof ContextSourceTool source
+					? Math.min(maxCallsPerTool, source.maxCallsPerTurn()) : maxCallsPerTool;
+			if (count >= limit) {
+				return "Tool call limit (%d) exceeded for tool '%s' in this turn".formatted(limit, name);
 			}
 			if (total >= maxTotalToolCalls) {
 				return "Total tool call limit (%d) exceeded in this turn".formatted(maxTotalToolCalls);
@@ -1133,11 +1182,18 @@ public class AgentToolNode implements NodeActionWithConfig {
 
 		private ToolExecutionExceptionProcessor toolExecutionExceptionProcessor;
 
+		private ToolPermissionPolicy toolPermissionPolicy;
+
 		private Builder() {
 		}
 
 		public Builder agentName(String agentName) {
 			this.agentName = agentName;
+			return this;
+		}
+
+		public Builder toolPermissionPolicy(ToolPermissionPolicy policy) {
+			this.toolPermissionPolicy = policy;
 			return this;
 		}
 
